@@ -1,0 +1,13 @@
+{
+  "scriptFile": "__init__.py",
+  "bindings": [
+    {
+      "type": "eventGridTrigger",
+      "name": "event",
+      "direction": "in",
+	  "eventHubName": "udadeveventhub", 
+	  "connection": "Endpoint=sb://udaeventhubns.servicebus.windows.net/;SharedAccessKeyName=udadevfunctionstring;SharedAccessKey=VoroSqJ0/6J/ds4iMdXSKpMY8Z96lEIydEuqcuD6qAU=;EntityPath=udadeveventhub"
+    }
+  ]
+}
+

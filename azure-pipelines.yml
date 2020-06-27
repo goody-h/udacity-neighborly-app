@@ -1,0 +1,173 @@
+trigger:
+- master
+
+variables:
+  # Azure Resource Manager connection created during pipeline creation
+  azureServiceConnectionId: '4e3addd8-049d-4f47-9b00-7bf552bd9b65'
+  
+  # Web app name
+  webAppName: 'udadevapp'
+
+  # Function app name
+  functionAppName: 'udadevfunction'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  # Environment name
+  environmentName: 'udadevapp'
+
+  # Project root folders
+  terraformRoot: $(System.DefaultWorkingDirectory)/terraform
+  apiRoot: $(System.DefaultWorkingDirectory)/NeighborlyAPI
+  frontEndRoot: $(System.DefaultWorkingDirectory)/NeighborlyFrontEnd
+
+  # Python version: 3.7
+  pythonVersion: '3.7'
+
+  # Terraform backend key
+  tfStateKey: $(tf-state-key)
+
+  # Service principal identity
+  clientId: $(client-id)
+  clientSecrete: $(client-secrete)
+
+  imageRepository: 'udadevapp'
+
+stages:
+- stage: Provision
+  displayName: provision infrastructure
+  jobs:
+  - job: ProvisionJob
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: DownloadSecureFile@1
+      name: publicSSH
+      displayName: 'Download Public SSH Key'
+      inputs:
+        secureFile: 'tf_id_rsa.pub'
+    - task: TerraformInstaller@0
+      displayName: 'Install terraform'
+      inputs:
+        terraformVersion: '0.12.28'
+    - script: 
+        terraform init
+        -backend-config="storage_account_name=udadevstore"
+        -backend-config="container_name=tfstate"
+        -backend-config="access_key=$(tfStateKey)"
+        -backend-config="key=codelab.microsoft.tfstate"
+      displayName: 'Initialize terraform'
+      workingDirectory: $(terraformRoot)
+    - script:
+        terraform apply -auto-approve
+        -var="ssh_public_key=$(publicSSH.secureFilePath)"
+        -var="client_id=$(clientId)"
+        -var="client_secret=$(clientSecrete)"
+      displayName: 'Apply terraform configuration'
+      workingDirectory: $(terraformRoot)
+
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: BuildJob
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    # Build FrontEnd
+    - task: Docker@2
+      displayName: Build
+      inputs:
+        command: build
+        repository: udadevcontainerregistry.azurecr.io/udadevapp
+        dockerfile: "**/Dockerfile"
+        tags: |
+          $(Build.BuildId)
+          latest
+
+    - task: AzureCLI@2
+      displayName: Azure CLI
+      inputs:
+        azureSubscription: '$(azureServiceConnectionId)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login --name udaDevContainerRegistry
+          docker push udadevcontainerregistry.azurecr.io/udadevapp:$(Build.BuildId)
+          docker push udadevcontainerregistry.azurecr.io/udadevapp:latest
+
+    - upload: "$(frontEndRoot)/manifests"
+      artifact: manifests
+    
+    # Build Functions API
+    - bash: |
+        if [ -f extensions.csproj ]
+        then
+            dotnet build extensions.csproj --runtime ubuntu.16.04-x64 --output ./bin
+        fi
+      workingDirectory: $(apiRoot)
+      displayName: 'Build extensions'
+    - bash: |
+        python -m venv .python_packages
+        source .python_packages/bin/activate
+        pip install --target="./.python_packages/lib/site-packages" -r requirements.txt
+      workingDirectory: $(apiRoot)
+      displayName: 'Install application dependencies'
+    - task: ArchiveFiles@2
+      displayName: 'Archive files'
+      inputs:
+        rootFolderOrFile: '$(apiRoot)'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId)-api.zip
+        replaceExistingArchive: true
+
+    - upload: $(Build.ArtifactStagingDirectory)/
+      displayName: 'Upload packages'
+      artifact: drop
+
+- stage: Deploy
+  displayName: 'Deploy Web App'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeploymentJob
+    pool:
+      vmImage: $(vmImageName)
+    environment: $(environmentName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+            displayName: 'Use Python version'
+
+          # Deploy FrontEnd to App Service
+          - task: AzureCLI@2
+            displayName: Azure CLI
+            inputs:
+              azureSubscription: '$(azureServiceConnectionId)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az aks install-cli
+                az aks get-credentials --resource-group uda-dev-azure-k8s --name uda-dev-k8s
+                kubectl apply -f $(Pipeline.Workspace)/manifests/deployment.yml
+                kubectl apply -f $(Pipeline.Workspace)/manifests/service.yml
+    
+          # Deploy Functions API
+          - task: AzureFunctionApp@1
+            displayName: 'Azure functions app deploy'
+            inputs:
+              azureSubscription: '$(azureServiceConnectionId)'
+              appType: functionAppLinux
+              appName: $(functionAppName)
+              package: '$(Pipeline.Workspace)/drop/$(Build.BuildId)-api.zip'

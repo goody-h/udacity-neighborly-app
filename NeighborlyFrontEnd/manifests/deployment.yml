@@ -1,0 +1,16 @@
+apiVersion : apps/v1beta1
+kind: Deployment
+metadata:
+  name: udadevapp 
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: udadevapp 
+    spec:
+      containers:
+        - name: udadevapp 
+          image: udadevcontainerregistry.azurecr.io/udadevapp
+          ports:
+          - containerPort: 5000
